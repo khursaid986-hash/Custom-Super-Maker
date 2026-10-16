@@ -1,1 +1,109 @@
 
+name: A04s GSI Download and Verify
+
+on:
+  workflow_dispatch:
+    inputs:
+      gsi_url:
+        description: "Direct HTTPS download URL for a GSI image or archive"
+        required: true
+        type: string
+      expected_sha256:
+        description: "Expected SHA-256 checksum (optional)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  download-gsi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Prepare tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl file xz-utils
+          mkdir -p output
+
+      - name: Download GSI
+        env:
+          GSI_URL: ${{ inputs.gsi_url }}
+        run: |
+          set -euo pipefail
+
+          case "$GSI_URL" in
+            https://*) ;;
+            *)
+              echo "::error::Only HTTPS URLs are accepted."
+              exit 1
+              ;;
+          esac
+
+          curl --fail --location --retry 3 \
+            --connect-timeout 30 \
+            --max-time 1500 \
+            "$GSI_URL" \
+            --output output/gsi_download
+
+          test -s output/gsi_download
+
+          echo "Downloaded file information:"
+          file output/gsi_download
+          du -h output/gsi_download
+
+      - name: Verify image archive
+        run: |
+          set -euo pipefail
+
+          TYPE="$(file -b output/gsi_download)"
+          echo "Detected: $TYPE"
+
+          if [[ "$TYPE" == *"XZ compressed"* ]]; then
+            xz -t output/gsi_download
+            echo "XZ integrity check passed."
+          elif [[ "$TYPE" == *"Android sparse image"* ]]; then
+            echo "Android sparse image detected."
+          elif [[ "$TYPE" == *"ext4 filesystem data"* ]]; then
+            echo "Filesystem image detected."
+          elif [[ "$TYPE" == *"Zip archive data"* ]]; then
+            unzip -t output/gsi_download
+          else
+            echo "::warning::Unknown image format. Further verification is required."
+          fi
+
+      - name: Verify SHA-256
+        env:
+          EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+        run: |
+          set -euo pipefail
+
+          ACTUAL="$(sha256sum output/gsi_download | awk '{print $1}')"
+          echo "Actual SHA-256: $ACTUAL"
+
+          if [ -n "$EXPECTED_SHA256" ]; then
+            if ! [[ "$EXPECTED_SHA256" =~ ^[a-fA-F0-9]{64}$ ]]; then
+              echo "::error::Expected SHA-256 must contain 64 hexadecimal characters."
+              exit 1
+            fi
+
+            if [ "${ACTUAL,,}" != "${EXPECTED_SHA256,,}" ]; then
+              echo "::error::SHA-256 mismatch."
+              exit 1
+            fi
+
+            echo "SHA-256 verification passed."
+          else
+            echo "No expected checksum supplied; authenticity is not verified."
+          fi
+
+      - name: Upload GSI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: a04s-gsi-download
+          path: output/gsi_download
+          if-no-files-found: error
+          retention-days: 7
+
