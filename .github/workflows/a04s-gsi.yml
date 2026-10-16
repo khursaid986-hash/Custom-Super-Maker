@@ -1,109 +1,81 @@
 
-name: A04s GSI Download and Verify
+name: A04s Stock Firmware and GSI
 
-'on':
+on:
   workflow_dispatch:
     inputs:
       gsi_url:
-        description: "Direct HTTPS download URL for a GSI image or archive"
+        description: "Direct download URL of the DerpFest GSI .img.xz"
         required: true
         type: string
-      expected_sha256:
-        description: "Expected SHA-256 checksum (optional)"
-        required: false
+      stock_firmware_url:
+        description: "MEGA share URL of Samsung stock firmware"
+        required: true
         type: string
 
-permissions:
-  contents: read
-
 jobs:
-  download-gsi:
+  download-and-verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
     steps:
-      - name: Prepare tools
+      - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl file xz-utils
-          mkdir -p output
+          sudo apt-get install -y curl xz-utils coreutils megatools file
 
-      - name: Download GSI
+      - name: Prepare folders
+        run: |
+          mkdir -p output stock
+          df -h
+
+      - name: Download DerpFest GSI
         env:
           GSI_URL: ${{ inputs.gsi_url }}
         run: |
-          set -euo pipefail
-
+          set -e
           case "$GSI_URL" in
             https://*) ;;
-            *)
-              echo "::error::Only HTTPS URLs are accepted."
-              exit 1
-              ;;
+            *) echo "ERROR: GSI URL must start with https://"; exit 1 ;;
           esac
+          curl -fL --retry 3 --retry-delay 5 \
+            "$GSI_URL" -o output/derpfest.img.xz
+          echo "GSI download complete"
+          ls -lh output/derpfest.img.xz
+          file output/derpfest.img.xz
+          xz -t output/derpfest.img.xz
+          sha256sum output/derpfest.img.xz \
+            | tee output/derpfest.sha256
 
-          curl --fail --location --retry 3 \
-            --connect-timeout 30 \
-            --max-time 1500 \
-            "$GSI_URL" \
-            --output output/gsi_download
-
-          test -s output/gsi_download
-
-          echo "Downloaded file information:"
-          file output/gsi_download
-          du -h output/gsi_download
-
-      - name: Verify image archive
-        run: |
-          set -euo pipefail
-
-          TYPE="$(file -b output/gsi_download)"
-          echo "Detected: $TYPE"
-
-          if [[ "$TYPE" == *"XZ compressed"* ]]; then
-            xz -t output/gsi_download
-            echo "XZ integrity check passed."
-          elif [[ "$TYPE" == *"Android sparse image"* ]]; then
-            echo "Android sparse image detected."
-          elif [[ "$TYPE" == *"ext4 filesystem data"* ]]; then
-            echo "Filesystem image detected."
-          elif [[ "$TYPE" == *"Zip archive data"* ]]; then
-            unzip -t output/gsi_download
-          else
-            echo "::warning::Unknown image format. Further verification is required."
-          fi
-
-      - name: Verify SHA-256
+      - name: Download Samsung stock firmware from MEGA
         env:
-          EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+          STOCK_URL: ${{ inputs.stock_firmware_url }}
         run: |
-          set -euo pipefail
+          set -e
+          case "$STOCK_URL" in
+            https://mega.nz/*|https://mega.co.nz/*) ;;
+            *) echo "ERROR: Provide a valid MEGA share URL"; exit 1 ;;
+          esac
+          megadl "$STOCK_URL" --path stock
+          echo "MEGA download complete"
+          find stock -maxdepth 2 -type f -printf '%p %s bytes\n'
+          test "$(find stock -type f | wc -l)" -gt 0
+          find stock -type f -print0 \
+            | xargs -0 sha256sum \
+            | tee output/stock-firmware.sha256
 
-          ACTUAL="$(sha256sum output/gsi_download | awk '{print $1}')"
-          echo "Actual SHA-256: $ACTUAL"
+      - name: Check available space
+        if: always()
+        run: |
+          df -h
+          du -sh output stock 2>/dev/null || true
 
-          if [ -n "$EXPECTED_SHA256" ]; then
-            if ! [[ "$EXPECTED_SHA256" =~ ^[a-fA-F0-9]{64}$ ]]; then
-              echo "::error::Expected SHA-256 must contain 64 hexadecimal characters."
-              exit 1
-            fi
-
-            if [ "${ACTUAL,,}" != "${EXPECTED_SHA256,,}" ]; then
-              echo "::error::SHA-256 mismatch."
-              exit 1
-            fi
-
-            echo "SHA-256 verification passed."
-          else
-            echo "No expected checksum supplied; authenticity is not verified."
-          fi
-
-      - name: Upload GSI artifact
+      - name: Upload downloaded files
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: a04s-gsi-download
-          path: output/gsi_download
+          name: A04s-Stock-and-DerpFest
+          path: |
+            output/
+            stock/
           if-no-files-found: error
-          retention-days: 7
-
+          compression-level: 0
+          retention-days: 3
