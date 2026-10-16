@@ -1,7 +1,7 @@
 
 name: A04s GSI Download and Verify
 
-on:
+'on':
   workflow_dispatch:
     inputs:
       gsi_url:
