@@ -1,5 +1,5 @@
 # A descriptive name for the workflow, shown in the GitHub Actions UI.
-name: Please use Android...Repack (Build & Release) instead
+name: Android...Repack 
 
 # This section defines how the workflow is triggered.
 on:
