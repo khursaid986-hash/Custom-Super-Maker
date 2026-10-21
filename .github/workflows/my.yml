@@ -1,0 +1,236 @@
+# A descriptive name for the workflow, shown in the GitHub Actions UI.
+name: Please use Android...Repack (Build & Release) instead
+
+# This section defines how the workflow is triggered.
+on:
+  # 'workflow_dispatch' allows you to run this workflow manually from the
+  # "Actions" tab in your GitHub repository.
+  workflow_dispatch:
+    # 'inputs' defines the parameters you can provide when running the workflow manually.
+    inputs:
+      stock_firmware_url:
+        description: 'URL to the stock firmware (Direct HTTP, MEGA.nz, etc.).'
+        required: true
+        type: string
+      custom_system_url:
+        description: 'Custom ROM download URL (.img, .img.xz, .img.gz, .zip supported)'
+        required: true
+        type: string
+      no_flash_flag:
+        description: 'The flag to prevent the script from trying to flash (e.g., -n, --no-flash). Leave blank if none.'
+        required: false
+        type: string
+      empty_product:
+        description: 'Use empty product.img (-e flag)'
+        required: false
+        type: boolean
+        default: false
+      empty_system_ext:
+        description: 'Use empty system_ext.img (-x flag)'
+        required: false
+        type: boolean
+        default: false
+      silent_mode:
+        description: 'Silent mode for the script (-s flag)'
+        required: false
+        type: boolean
+        default: true
+      writable:
+        description: 'Make partitions writable (-w flag)'
+        required: false
+        type: boolean
+        default: false
+      purge_all:
+        description: 'Purge repacksuper directory after use (-p flag)'
+        required: false
+        type: boolean
+        default: true
+
+# A workflow is made up of one or more 'jobs'. This job is named 'repack-super'.
+jobs:
+  repack-super:
+    # We use a larger runner to avoid "No space left on device" errors, but your cleanup scripts are essential.
+    runs-on: ubuntu-latest
+
+    # 'steps' are a sequence of tasks that will be executed as part of the job.
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # --- START OF DISK SPACE CLEANUP ---
+    - name: Free disk space (1/3) - Manual Cleanup
+      run: |
+        echo "Initial disk space:"
+        df -h
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo rm -rf /tmp/* /var/tmp/* || true
+        sudo docker image prune --all --force || true
+        sudo apt-get clean || true
+        sudo apt-get autoremove -y || true
+        echo "Disk space after manual cleanup:"
+        df -h
+    - name: Free disk space (2/3) - Action (Tool Cache)
+      uses: jlumbroso/free-disk-space@main
+      with:
+        tool-cache: true
+    - name: Free disk space (3/3) - Action (SlimHub)
+      uses: rokibhasansagar/slimhub_actions@main
+      with:
+        retain: ''
+    # --- END OF DISK SPACE CLEANUP ---
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y android-sdk-libsparse-utils tar xz-utils liblz4-tool unzip gzip p7zip-full file wget curl megatools
+        sudo apt-get clean || true
+
+    - name: Verify and Prepare Script
+      run: |
+        if [ ! -f "./scripts/repacksuper.sh" ]; then echo "✗ Error: repacksuper.sh not found" && exit 1; fi
+        chmod +x ./scripts/repacksuper.sh
+
+    - name: Create working directory
+      run: mkdir -p work
+
+    - name: Generate Firmware URL Hash for Cache
+      id: generate_hash
+      run: |
+        echo "fw_hash=$(echo -n "${{ github.event.inputs.stock_firmware_url }}" | md5sum | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+
+    - name: Cache Stock Firmware
+      id: cache-stock
+      uses: actions/cache@v4
+      with:
+        path: work/stock_firmware.zip
+        key: ${{ runner.os }}-stock-${{ steps.generate_hash.outputs.fw_hash }}
+
+    - name: Download and Extract Stock Firmware
+      run: |
+        cd work
+        FIRMWARE_URL="${{ github.event.inputs.stock_firmware_url }}"
+
+        if [ "${{ steps.cache-stock.outputs.cache-hit }}" != 'true' ]; then
+          echo "==> No cache hit. Downloading stock firmware..."
+          if [[ $FIRMWARE_URL == *"mega.nz"* ]]; then
+            megadl -o stock_firmware.zip "$FIRMWARE_URL"
+          else
+            wget --user-agent="Mozilla/5.0" --content-disposition -O stock_firmware.zip --tries=5 --wait=10 "$FIRMWARE_URL"
+          fi
+        else
+          echo "==> Stock firmware cache was successfully restored."
+        fi
+
+        if [ ! -s "stock_firmware.zip" ]; then echo "✗ CRITICAL ERROR: Failed to download or find stock firmware." && exit 1; fi
+
+        unzip -o "stock_firmware.zip"
+
+        AP_FILE=$(find . -name "AP_*.tar.md5" | head -n 1)
+        if [ -z "$AP_FILE" ]; then echo "✗ Error: AP file not found." && ls -lR && exit 1; fi
+
+        tar -xvf "$AP_FILE" --wildcards '*super.img*.lz4'
+        rm -f "$AP_FILE"
+        rm -f BL_* CP_* HOME_CSC_* CSC_* stock_firmware.zip
+
+        SUPER_LZ4=$(ls *super.img*.lz4 | head -n 1)
+        lz4 -d "$SUPER_LZ4" stock_super_sparse.img
+        rm -f "$SUPER_LZ4"
+
+        if [ ! -f "stock_super_sparse.img" ]; then echo "✗ Error: Failed to create sparse stock_super.img." && exit 1; fi
+
+        echo "Disk after stock firmware extraction:"
+        df -h
+
+    - name: Download and Prepare Custom system.img
+      run: |
+        cd work
+        wget -O custom_rom_package "${{ github.event.inputs.custom_system_url }}"
+        if [ ! -s "custom_rom_package" ]; then echo "✗ Error: Failed to download custom ROM." && exit 1; fi
+
+        FILE_TYPE=$(file -b custom_rom_package)
+        case "$FILE_TYPE" in
+          *"XZ compressed data"*)      mv custom_rom_package c.img.xz && unxz c.img.xz && mv c.img custom_system.img ;;
+          *"gzip compressed data"*)    mv custom_rom_package c.img.gz && gunzip c.img.gz && mv c.img custom_system.img ;;
+          *"Zip archive data"*)
+            unzip -o custom_rom_package ; rm -f custom_rom_package
+            SYSTEM_IMG_FILE=$(find . -maxdepth 1 -name "system.img" -o -name "system.raw.img" | head -n 1)
+            if [ -z "$SYSTEM_IMG_FILE" ]; then echo "✗ Error: system.img not found in ZIP." && exit 1; fi
+            mv "$SYSTEM_IMG_FILE" custom_system.img ;;
+          *"7z archive data"*)
+            7z x custom_rom_package ; rm -f custom_rom_package
+            SYSTEM_IMG_FILE=$(find . -maxdepth 1 -name "system.img" -o -name "system.raw.img" | head -n 1)
+            if [ -z "$SYSTEM_IMG_FILE" ]; then echo "✗ Error: system.img not found in 7z archive." && exit 1; fi
+            mv "$SYSTEM_IMG_FILE" custom_system.img ;;
+          *"Android sparse image"*)    mv custom_rom_package c_sparse.img && simg2img c_sparse.img custom_system.img && rm -f c_sparse.img ;;
+          *"ext4 filesystem data"*)    mv custom_rom_package custom_system.img ;;
+          *)                            rm -f custom_rom_package; echo "✗ Error: Unsupported file type" && exit 1 ;;
+        esac
+
+        if [ ! -f "custom_system.img" ]; then echo "✗ Error: custom_system.img not created." && exit 1; fi
+
+        echo "Disk after custom system download/extract:"
+        df -h
+
+    - name: Download ASRControl APK
+      run: |
+        cd work
+        wget -q -O ASRControl.apk "https://github.com/minhmc2007/minhmc2007/releases/download/v0.0.1/app-debug.apk" || echo "Warning: APK download failed."
+        echo "Disk after APK download:"
+        df -h
+
+    - name: Cleanup large temp files before branding
+      run: |
+        cd work
+        rm -f *.zip *.tar *.md5 *.lz4 || true
+        find . -type f \( -name "*.zip" -o -name "*.tar" -o -name "*.md5" -o -name "*.lz4" \) -delete || true
+        echo "Disk before branding step:"
+        df -h
+
+    - name: System Branding (APK, pfetch, build.prop)
+      run: |
+        cd work
+        chmod +x ../scripts/brand_system.sh
+        sudo ../scripts/brand_system.sh \
+          --image custom_system.img \
+          --apk ASRControl.apk \
+          --gsi-name "${{ env.ROM_NAME }}"
+
+    - name: Prepare repacksuper.sh flags
+      id: prepare_flags
+      run: |
+        FLAGS="-r $(pwd)/work"
+        if [ "${{ github.event.inputs.silent_mode }}" == "true" ]; then FLAGS="$FLAGS -s"; fi
+        if [ "${{ github.event.inputs.purge_all }}" == "true" ]; then FLAGS="$FLAGS -p"; fi
+        if [ "${{ github.event.inputs.empty_product }}" == "true" ]; then FLAGS="$FLAGS -e"; fi
+        if [ "${{ github.event.inputs.empty_system_ext }}" == "true" ]; then FLAGS="$FLAGS -x"; fi
+        if [ "${{ github.event.inputs.writable }}" == "true" ]; then FLAGS="$FLAGS -w"; fi
+        if [ -n "${{ github.event.inputs.no_flash_flag }}" ]; then FLAGS="$FLAGS ${{ github.event.inputs.no_flash_flag }}"; fi
+        echo "flags=$FLAGS" >> $GITHUB_OUTPUT
+
+    - name: Run repacksuper.sh
+      run: |
+        echo "==> Running repacksuper.sh with flags: ${{ steps.prepare_flags.outputs.flags }}"
+        ./scripts/repacksuper.sh ${{ steps.prepare_flags.outputs.flags }} work/stock_super_sparse.img work/custom_system.img work/repacked_super.img
+        rm -f work/stock_super_sparse.img work/custom_system.img
+
+    - name: Verify output and Create Tarball
+      run: |
+        cd work
+        if [ ! -f "repacked_super.img" ]; then echo "✗ Error: repacked_super.img not found." && ls -la && exit 1; fi
+        tar -cvf repacked_super.tar repacked_super.img
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: repacked-super-img
+        path: |
+          work/repacked_super.img
+        retention-days: 60
+
+    - name: Final Space Check
+      if: always()
+      run: |
+        echo "Final disk space:"
+        df -h
+        sudo rm -rf /tmp/* /var/tmp/* || true
+        sudo apt-get clean || true
